@@ -324,6 +324,62 @@ body {
   text-align: center; margin-top: 12px; font-size: 10px;
   color: rgba(255,255,255,0.14); letter-spacing: 1.5px; text-transform: uppercase;
 }
+
+/* ═══ DATE PICKER WIDGET ═══ */
+#date-picker-widget {
+  display: none; position: fixed; inset: 0; z-index: 200;
+  align-items: center; justify-content: center;
+  background: rgba(0,0,0,0.6); backdrop-filter: blur(8px);
+}
+#date-picker-widget.open { display: flex; }
+.dp-card {
+  background: #0f0c0d; border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 20px; padding: 28px; width: 380px; max-width: 95vw;
+  box-shadow: 0 24px 80px rgba(0,0,0,0.7);
+  animation: heroIn .35s cubic-bezier(.16,1,.3,1) both;
+}
+.dp-title {
+  font-family: 'Playfair Display', serif; font-size: 17px;
+  color: rgba(255,255,255,0.9); margin-bottom: 4px;
+}
+.dp-sub { font-size: 11px; color: rgba(255,255,255,0.3); margin-bottom: 20px; letter-spacing: .5px; }
+.dp-label { font-size: 11px; font-weight: 600; color: rgba(255,255,255,0.4); letter-spacing: 1px; text-transform: uppercase; margin-bottom: 8px; }
+#dp-date-input {
+  width: 100%; padding: 11px 14px; border-radius: 12px;
+  border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.04);
+  color: rgba(255,255,255,0.85); font-size: 14px; font-family: 'Outfit', sans-serif;
+  outline: none; transition: border-color .3s; margin-bottom: 20px;
+}
+#dp-date-input:focus { border-color: rgba(178,34,52,0.5); }
+.dp-slots-label { font-size: 11px; font-weight: 600; color: rgba(255,255,255,0.4); letter-spacing: 1px; text-transform: uppercase; margin-bottom: 10px; }
+#dp-slots {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;
+  min-height: 48px; margin-bottom: 20px;
+}
+.dp-slot {
+  padding: 9px 0; border-radius: 10px; border: 1px solid rgba(255,255,255,0.1);
+  background: rgba(255,255,255,0.03); color: rgba(255,255,255,0.6);
+  font-size: 12px; font-weight: 500; cursor: pointer; text-align: center;
+  font-family: 'Outfit', sans-serif; transition: all .25s;
+}
+.dp-slot:hover { background: rgba(178,34,52,0.15); border-color: rgba(178,34,52,0.4); color: #fff; }
+.dp-slot.selected { background: linear-gradient(135deg,#B22234,#D44840); border-color: transparent; color: #fff; box-shadow: 0 4px 16px rgba(178,34,52,0.4); }
+.dp-slot.taken { opacity: 0.25; cursor: not-allowed; text-decoration: line-through; }
+.dp-slot-msg { font-size: 12px; color: rgba(255,255,255,0.3); text-align: center; padding: 12px 0; }
+.dp-actions { display: flex; gap: 10px; }
+.dp-btn-cancel {
+  flex: 1; padding: 12px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.08);
+  background: transparent; color: rgba(255,255,255,0.4); font-size: 13px; font-weight: 500;
+  cursor: pointer; font-family: 'Outfit', sans-serif; transition: all .25s;
+}
+.dp-btn-cancel:hover { background: rgba(255,255,255,0.05); color: rgba(255,255,255,0.7); }
+.dp-btn-confirm {
+  flex: 2; padding: 12px; border-radius: 12px; border: none;
+  background: linear-gradient(135deg,#B22234,#D44840); color: #fff;
+  font-size: 13px; font-weight: 600; cursor: pointer; font-family: 'Outfit', sans-serif;
+  transition: all .25s; opacity: 0.4; pointer-events: none;
+}
+.dp-btn-confirm.ready { opacity: 1; pointer-events: all; box-shadow: 0 4px 20px rgba(178,34,52,0.4); }
 </style>
 </head>
 <body>
@@ -377,6 +433,22 @@ document.body.appendChild(d);}
 <div id="chat-area">
   <div id="chat-inner">
     <!-- Hero inserted by JS -->
+  </div>
+</div>
+
+<!-- ═══ DATE PICKER WIDGET ═══ -->
+<div id="date-picker-widget">
+  <div class="dp-card">
+    <div class="dp-title">📅 Select Appointment Date & Time</div>
+    <div class="dp-sub">MONDAY – FRIDAY · 09:00 – 16:30 · 30-MINUTE SLOTS</div>
+    <div class="dp-label">Date</div>
+    <input type="date" id="dp-date-input">
+    <div class="dp-slots-label">Available Times</div>
+    <div id="dp-slots"><div class="dp-slot-msg">Select a date to see available slots.</div></div>
+    <div class="dp-actions">
+      <button class="dp-btn-cancel" onclick="closeDatePicker()">Cancel</button>
+      <button class="dp-btn-confirm" id="dp-confirm-btn" onclick="confirmSlot()">Confirm</button>
+    </div>
   </div>
 </div>
 
@@ -626,6 +698,7 @@ async function sendMessage() {
     hideThinking();
     messages.push({ role: 'assistant', content: data.response, intent: data.intent, time: timeStr() });
     renderMessages();
+    checkForDatePrompt(data.response, data.intent);
   } catch (e) {
     hideThinking();
     messages.push({ role: 'assistant', content: 'Connection error. Make sure the server is running.', intent: 'out_of_scope', time: timeStr() });
@@ -643,6 +716,100 @@ function resetChat() {
   updateStatusDots(null);
   renderHero();
   msgInput.focus();
+}
+
+// ═══ DATE PICKER WIDGET ═══
+let dpSelectedDate = null;
+let dpSelectedTime = null;
+let dpPendingBooking = {};   // { service, location, name } collected from chat context
+
+const dpWidget    = document.getElementById('date-picker-widget');
+const dpDateInput = document.getElementById('dp-date-input');
+const dpSlots     = document.getElementById('dp-slots');
+const dpConfirm   = document.getElementById('dp-confirm-btn');
+
+// Set min date to today
+dpDateInput.min = new Date().toISOString().split('T')[0];
+
+// Detect appointment booking context in agent responses
+function checkForDatePrompt(response, intent) {
+  if (intent !== 'appointment_booker') return;
+  const lower = response.toLowerCase();
+  const dateKeywords = ['what date', 'preferred date', 'which date', 'date would you', 'date and time', 'when would you'];
+  if (dateKeywords.some(k => lower.includes(k))) {
+    // Extract any context already collected from recent messages
+    extractBookingContext();
+    openDatePicker();
+  }
+}
+
+function extractBookingContext() {
+  // Scan recent assistant messages for collected slots
+  const recentMsgs = messages.slice(-6);
+  dpPendingBooking = {};
+  const serviceMatch = recentMsgs.map(m => m.content).join(' ').match(/service[:\s]+(visa application|passport renewal|travel health consultation)/i);
+  const locationMatch = recentMsgs.map(m => m.content).join(' ').match(/location[:\s]+([A-Za-z\s]+?)(?:\n|,|\.|$)/i);
+  const nameMatch = recentMsgs.map(m => m.content).join(' ').match(/name[:\s]+([A-Za-z\s]+?)(?:\n|,|\.|$)/i);
+  if (serviceMatch) dpPendingBooking.service = serviceMatch[1];
+  if (locationMatch) dpPendingBooking.location = locationMatch[1].trim();
+  if (nameMatch) dpPendingBooking.name = nameMatch[1].trim();
+}
+
+function openDatePicker() {
+  dpSelectedDate = null;
+  dpSelectedTime = null;
+  dpDateInput.value = '';
+  dpSlots.innerHTML = '<div class="dp-slot-msg">Select a date to see available slots.</div>';
+  dpConfirm.classList.remove('ready');
+  dpWidget.classList.add('open');
+}
+
+function closeDatePicker() {
+  dpWidget.classList.remove('open');
+}
+
+async function loadSlots(dateStr) {
+  dpSlots.innerHTML = '<div class="dp-slot-msg">Loading slots…</div>';
+  dpSelectedTime = null;
+  dpConfirm.classList.remove('ready');
+  try {
+    const res = await fetch(`/api/available-slots?date=${dateStr}`);
+    const data = await res.json();
+    if (data.message || !data.slots.length) {
+      dpSlots.innerHTML = `<div class="dp-slot-msg">${data.message || 'No slots available.'}</div>`;
+      return;
+    }
+    dpSlots.innerHTML = data.slots.map(s =>
+      `<button class="dp-slot${s.available ? '' : ' taken'}" onclick="${s.available ? `selectSlot('${s.time}', this)` : ''}">${s.time}</button>`
+    ).join('');
+  } catch {
+    dpSlots.innerHTML = '<div class="dp-slot-msg">Could not load slots. Check server.</div>';
+  }
+}
+
+function selectSlot(time, el) {
+  document.querySelectorAll('.dp-slot').forEach(s => s.classList.remove('selected'));
+  el.classList.add('selected');
+  dpSelectedTime = time;
+  dpConfirm.classList.add('ready');
+}
+
+dpDateInput.addEventListener('change', e => {
+  dpSelectedDate = e.target.value;
+  if (dpSelectedDate) loadSlots(dpSelectedDate);
+});
+
+async function confirmSlot() {
+  if (!dpSelectedDate || !dpSelectedTime) return;
+  closeDatePicker();
+
+  // Send the chosen date/time into the chat as a user message
+  const dateLabel = new Date(dpSelectedDate + 'T12:00:00').toLocaleDateString('en-CA', {weekday:'long', year:'numeric', month:'long', day:'numeric'});
+  const slotMsg = `My preferred date is ${dateLabel} at ${dpSelectedTime}.`;
+  msgInput.value = slotMsg;
+  await sendMessage();
+
+  // Booking is saved server-side by extract_booking_from_messages in /api/chat
 }
 
 // ── Init ──
