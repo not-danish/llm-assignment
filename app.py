@@ -26,7 +26,7 @@ app = Flask(__name__, static_folder="static")
 llm = ChatOpenAI(
     model="qwen3-30b-a3b-fp8",
     base_url=os.getenv("QWEN_API_BASE_URL"),
-    openai_api_key=os.getenv("OPENAI_API_KEY", "1006174042"),
+    openai_api_key=os.getenv("OPENAI_API_KEY"),
     temperature=0.3,
 )
 

@@ -1,2 +1,14 @@
 /chroma_db_canada_travel
 .env
+
+# Environment and local machine artifacts
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Jupyter artifacts
+.ipynb_checkpoints/

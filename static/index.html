@@ -449,7 +449,8 @@ body {
 <script>
 function checkPassword() {
   const input = document.getElementById('pw-input');
-  if (input.value === 'Team12') {
+  // Demo-only gate. Client-side checks are not security controls.
+  if (input.value.trim().toLowerCase() === 'demo') {
     document.getElementById('pw-gate').classList.add('hidden');
     // Now show and trigger the splash animation
     const splash = document.getElementById('splash');
