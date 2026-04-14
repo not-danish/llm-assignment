@@ -64,6 +64,20 @@ Frontend demo gate value is `demo` (for UX only, not real security).
 - `POST /api/save-booking`: Save simulated booking
 - `GET /api/bookings`: List simulated bookings
 
+## External APIs and Data Sources
+
+- Government of Canada Travel Advice and Advisories (`travel.gc.ca`) is the primary knowledge source used to build the retrieval corpus.
+- REST Countries API (`https://restcountries.com/v3.1/name`) is used in the notebook agent workflow for read-only country-name validation during typo handling.
+- LLM inference is called through the configured OpenAI-compatible endpoint in `QWEN_API_BASE_URL`.
+
+## Agent Robustness
+
+- Typo-resilient destination handling: API-first country validation, then conservative fuzzy recovery and confirmation prompts when confidence is high.
+- Guardrail-aware supervision: explicit handling for prompt-injection attempts, ambiguity clarification, temporal warnings, and multi-turn continuity.
+- Conservative reliability behavior: partial-context responses, explicit no-fabrication fallbacks, and redirection to official sources when coverage is incomplete.
+- Evaluation discipline: structured 18-case test set covering routing correctness, task correctness, guardrail compliance, and multi-turn completion.
+- Realistic simulation UX for booking: business-hour slot logic, duplicate prevention, and deterministic simulated reference IDs.
+
 ## Notebook Workflow
 
 ### 1) Build or refresh travel data and vectors
