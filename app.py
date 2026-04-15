@@ -9,6 +9,8 @@ import re
 import json
 import random
 import string
+import difflib
+import unicodedata
 from datetime import date, timedelta
 from pathlib import Path
 from flask import Flask, request, jsonify, send_from_directory
@@ -46,7 +48,6 @@ _DESTINATION_ALIASES = {
     "scotland": "united kingdom",
     "wales": "united kingdom",
     "usa": "united states",
-    "us": "united states",
     "america": "united states",
     "south korea": "korea, republic of",
     "north korea": "korea, democratic people",
@@ -59,10 +60,22 @@ _DESTINATION_ALIASES = {
 
 
 _known_destinations: list[str] = []   # canonical lowercased destination names, built at index time
+_known_destinations_norm: list[str] = []
+_dest_norm_to_canonical: dict[str, str] = {}
+
+
+def _normalize_text(text: str) -> str:
+    """Lowercase and normalize text for accent/punctuation-insensitive matching."""
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _build_rag_index():
-    global _rag_chunks, _rag_corpus, _tfidf_vectorizer, _tfidf_matrix, _known_destinations
+    global _rag_chunks, _rag_corpus, _tfidf_vectorizer, _tfidf_matrix
+    global _known_destinations, _known_destinations_norm, _dest_norm_to_canonical
     if not PARSED_PAGES_FILE.exists():
         print("[RAG] parsed_pages.json not found — RAG disabled")
         return
@@ -77,6 +90,10 @@ def _build_rag_index():
         if dest_lower and dest_lower not in seen_destinations:
             seen_destinations.add(dest_lower)
             _known_destinations.append(dest_lower)
+            dest_norm = _normalize_text(dest_lower)
+            if dest_norm and dest_norm not in _dest_norm_to_canonical:
+                _dest_norm_to_canonical[dest_norm] = dest_lower
+                _known_destinations_norm.append(dest_norm)
         for section in page.get("sections", []):
             heading = section.get("heading", "")
             text = section.get("text", "")
@@ -107,17 +124,71 @@ def _detect_destinations(query: str) -> list[str]:
     Checks alias map first, then scans known destination names directly.
     """
     q_lower = query.lower()
+    q_norm = _normalize_text(query)
     found: list[str] = []
+
+    def contains_term(text: str, term: str) -> bool:
+        # Match whole terms only so short aliases don't trigger inside other words.
+        return f" {term} " in f" {text} "
 
     # Alias map takes priority (e.g. "dubai" → "united arab emirates")
     for alias, canonical in _DESTINATION_ALIASES.items():
-        if alias in q_lower and canonical not in found:
-            found.append(canonical)
+        alias_norm = _normalize_text(alias)
+        canonical_norm = _normalize_text(canonical)
+        canonical_dest = _dest_norm_to_canonical.get(canonical_norm, canonical)
+        if contains_term(q_norm, alias_norm) and canonical_dest not in found:
+            found.append(canonical_dest)
 
     # Direct match against known destination names
-    for dest in _known_destinations:
-        if dest in q_lower and dest not in found:
-            found.append(dest)
+    for dest_norm in _known_destinations_norm:
+        if contains_term(q_norm, dest_norm):
+            canonical_dest = _dest_norm_to_canonical[dest_norm]
+            if canonical_dest not in found:
+                found.append(canonical_dest)
+
+    if found:
+        return found
+
+    # Fuzzy fallback for slightly misspelled/partial destinations, e.g. "baharain".
+    raw_tokens = q_norm.split()
+    tokens = [t for t in raw_tokens if len(t) >= 4]
+    if not tokens:
+        return found
+
+    stop_words = {
+        "travel", "advice", "visa", "entry", "requirements", "safety", "safe",
+        "country", "visit", "visiting", "tourism", "tourist", "need", "info",
+        "information", "about", "check", "latest", "guidance",
+    }
+    candidates = [t for t in tokens if t not in stop_words]
+
+    # Add short phrase candidates to capture multi-word destinations such as
+    # "cote d ivoire" and "bosnia and herzegovina" from partial inputs.
+    for n in (2, 3, 4):
+        for i in range(len(raw_tokens) - n + 1):
+            window = raw_tokens[i:i + n]
+            if all(w in stop_words for w in window):
+                continue
+            phrase = " ".join(window)
+            if len(phrase) >= 6:
+                candidates.append(phrase)
+
+    best_norm = None
+    best_score = 0.0
+
+    for cand in candidates:
+        for dest_norm in _known_destinations_norm:
+            score = difflib.SequenceMatcher(None, cand, dest_norm).ratio()
+            # Accept close spelling or strong prefix overlap for truncated inputs.
+            if score > best_score:
+                best_score = score
+                best_norm = dest_norm
+            if len(cand) >= 5 and dest_norm.startswith(cand) and (0.83 > best_score):
+                best_score = 0.83
+                best_norm = dest_norm
+
+    if best_norm and best_score >= 0.80:
+        found.append(_dest_norm_to_canonical[best_norm])
 
     return found
 
@@ -165,9 +236,11 @@ def retrieve_travel_advisory(query: str, top_k: int = 15) -> str:
     # Hard-boost all chunks belonging to detected destinations so they always win
     # over generic topic matches from other countries.
     if detected:
+        detected_norm = {_normalize_text(d) for d in detected}
         for i, chunk in enumerate(_rag_chunks):
-            dest_lower = chunk["destination"].lower()
-            if any(d in dest_lower for d in detected):
+            chunk_dest = chunk["destination"].replace(" travel advice", "")
+            chunk_dest_norm = _normalize_text(chunk_dest)
+            if chunk_dest_norm in detected_norm:
                 scores[i] = min(1.0, scores[i] + 0.5)
 
     top_indices = np.argsort(scores)[::-1][:top_k]
