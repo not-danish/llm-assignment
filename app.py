@@ -15,12 +15,160 @@ from flask import Flask, request, jsonify, send_from_directory
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 
 BOOKINGS_FILE = Path("bookings.json")
+PARSED_PAGES_FILE = Path("parsed_pages.json")
 
 load_dotenv()
 
 app = Flask(__name__, static_folder="static")
+
+# ── RAG index ─────────────────────────────────────────────────────────
+# Each chunk is one section from one destination page.
+# We keep rich metadata so we can reconstruct citations.
+_rag_chunks: list[dict] = []          # [{destination, risk_level, heading, text, doc_index}, ...]
+_rag_corpus: list[str] = []           # parallel list of strings used to build the TF-IDF matrix
+_tfidf_vectorizer: TfidfVectorizer | None = None
+_tfidf_matrix = None
+
+# Alias map: common names → canonical destination substrings in parsed_pages.json
+_DESTINATION_ALIASES = {
+    "uae": "united arab emirates",
+    "dubai": "united arab emirates",
+    "abu dhabi": "united arab emirates",
+    "sharjah": "united arab emirates",
+    "uk": "united kingdom",
+    "great britain": "united kingdom",
+    "england": "united kingdom",
+    "scotland": "united kingdom",
+    "wales": "united kingdom",
+    "usa": "united states",
+    "us": "united states",
+    "america": "united states",
+    "south korea": "korea, republic of",
+    "north korea": "korea, democratic people",
+    "drc": "congo, democratic republic",
+    "congo": "congo",
+    "burma": "myanmar",
+    "czechia": "czech republic",
+    "ivory coast": "côte d'ivoire",
+}
+
+
+def _build_rag_index():
+    global _rag_chunks, _rag_corpus, _tfidf_vectorizer, _tfidf_matrix
+    if not PARSED_PAGES_FILE.exists():
+        print("[RAG] parsed_pages.json not found — RAG disabled")
+        return
+
+    pages = json.loads(PARSED_PAGES_FILE.read_text(encoding="utf-8"))
+    for doc_idx, page in enumerate(pages):
+        destination = page.get("destination", "")
+        risk_level = page.get("risk_level", "")
+        for section in page.get("sections", []):
+            heading = section.get("heading", "")
+            text = section.get("text", "")
+            if not text.strip():
+                continue
+            chunk_text = f"{destination} {heading} {text}"
+            _rag_chunks.append({
+                "destination": destination,
+                "risk_level": risk_level,
+                "heading": heading,
+                "text": text,
+                "doc_index": doc_idx,
+            })
+            _rag_corpus.append(chunk_text)
+
+    _tfidf_vectorizer = TfidfVectorizer(
+        ngram_range=(1, 2),
+        max_features=50_000,
+        sublinear_tf=True,
+    )
+    _tfidf_matrix = _tfidf_vectorizer.fit_transform(_rag_corpus)
+    print(f"[RAG] Index built: {len(_rag_chunks)} chunks from {len(pages)} destinations")
+
+
+def _resolve_destination(query: str) -> str | None:
+    """Return the canonical destination name substring if an alias is found."""
+    q_lower = query.lower()
+    for alias, canonical in _DESTINATION_ALIASES.items():
+        if alias in q_lower:
+            return canonical
+    return None
+
+
+def retrieve_travel_advisory(query: str, top_k: int = 8) -> str:
+    """
+    Retrieve the most relevant sections from parsed_pages.json for the given query.
+    Returns a formatted context string ready to inject into the system prompt.
+    """
+    if _tfidf_vectorizer is None or _tfidf_matrix is None:
+        return ""
+
+    # Expand query with alias resolution
+    canonical = _resolve_destination(query)
+    expanded_query = f"{query} {canonical}" if canonical else query
+
+    query_vec = _tfidf_vectorizer.transform([expanded_query])
+    scores = cosine_similarity(query_vec, _tfidf_matrix).flatten()
+
+    # If we resolved an alias, hard-boost all chunks from that destination
+    if canonical:
+        for i, chunk in enumerate(_rag_chunks):
+            if canonical in chunk["destination"].lower():
+                scores[i] = min(1.0, scores[i] + 0.5)
+
+    top_indices = np.argsort(scores)[::-1][:top_k]
+
+    if scores[top_indices[0]] < 0.01:
+        return ""
+
+    # Collect matched destination names so we can prepend critical advisories
+    matched_destinations: set[str] = set()
+    for idx in top_indices:
+        matched_destinations.add(_rag_chunks[idx]["destination"])
+
+    # Always prepend "avoid all travel" / "avoid non-essential travel" sections
+    # for matched destinations so the LLM never misses the headline advisory.
+    _CRITICAL_KEYWORDS = ("avoid all travel", "avoid non-essential travel", "do not travel")
+    priority_chunks: list[dict] = []
+    for chunk in _rag_chunks:
+        if chunk["destination"] not in matched_destinations:
+            continue
+        if any(kw in chunk["heading"].lower() for kw in _CRITICAL_KEYWORDS):
+            priority_chunks.append(chunk)
+
+    seen_dest_headings: set[str] = set()
+    sections: list[str] = []
+
+    def _format_chunk(chunk: dict) -> str:
+        dest_label = chunk["destination"].replace(" travel advice", "")
+        risk = f" [Risk level: {chunk['risk_level']}]" if chunk["risk_level"] else ""
+        return f"[{dest_label} - {chunk['heading']}]{risk}\n{chunk['text']}"
+
+    # Priority sections first (deduped)
+    for chunk in priority_chunks:
+        key = f"{chunk['destination']}||{chunk['heading']}"
+        if key not in seen_dest_headings:
+            seen_dest_headings.add(key)
+            sections.append(_format_chunk(chunk))
+
+    # Then top-ranked sections
+    for idx in top_indices:
+        chunk = _rag_chunks[idx]
+        key = f"{chunk['destination']}||{chunk['heading']}"
+        if key not in seen_dest_headings:
+            seen_dest_headings.add(key)
+            sections.append(_format_chunk(chunk))
+
+    return "\n\n---\n\n".join(sections)
+
+
+_build_rag_index()
 
 # ── LLM ───────────────────────────────────────────────────────────────
 llm = ChatOpenAI(
@@ -53,8 +201,20 @@ PROMPT_MAP = {
 OOS_RESPONSE = "I can only assist with Canadian travel advisories, visa guidance, and simulated appointment booking. Please ask a travel-related question!"
 
 
-def call_llm(system_prompt, messages):
-    lc_msgs = [HumanMessage(content=f"[System]\n{system_prompt}")]
+def call_llm(system_prompt, messages, rag_context: str = ""):
+    if rag_context:
+        system_with_context = (
+            f"{system_prompt}\n\n"
+            "## Retrieved knowledge base context\n\n"
+            "The following sections were retrieved from the Government of Canada's "
+            "Travel Advice and Advisories database. Base your answer EXCLUSIVELY on "
+            "this content. Do not use any information not present below.\n\n"
+            f"{rag_context}"
+        )
+    else:
+        system_with_context = system_prompt
+
+    lc_msgs = [HumanMessage(content=f"[System]\n{system_with_context}")]
     for m in messages:
         if m["role"] == "user":
             lc_msgs.append(HumanMessage(content=m["content"]))
@@ -153,7 +313,16 @@ def chat():
             response = OOS_RESPONSE
         else:
             agent_prompt = PROMPT_MAP.get(intent, PROMPT_MAP["rag"])
-            response = call_llm(agent_prompt, messages)
+
+            # Build RAG query from the most recent user message
+            last_user_msg = next(
+                (m["content"] for m in reversed(messages) if m["role"] == "user"), ""
+            )
+            rag_context = ""
+            if intent in ("rag", "visa_checker"):
+                rag_context = retrieve_travel_advisory(last_user_msg)
+
+            response = call_llm(agent_prompt, messages, rag_context=rag_context)
 
         if temporal:
             response = f"⚠️ {temporal}\n\n{response}"
