@@ -58,16 +58,25 @@ _DESTINATION_ALIASES = {
 }
 
 
+_known_destinations: list[str] = []   # canonical lowercased destination names, built at index time
+
+
 def _build_rag_index():
-    global _rag_chunks, _rag_corpus, _tfidf_vectorizer, _tfidf_matrix
+    global _rag_chunks, _rag_corpus, _tfidf_vectorizer, _tfidf_matrix, _known_destinations
     if not PARSED_PAGES_FILE.exists():
         print("[RAG] parsed_pages.json not found — RAG disabled")
         return
 
     pages = json.loads(PARSED_PAGES_FILE.read_text(encoding="utf-8"))
+    seen_destinations: set[str] = set()
     for doc_idx, page in enumerate(pages):
         destination = page.get("destination", "")
         risk_level = page.get("risk_level", "")
+        # Build the known-destination list from actual page data
+        dest_lower = destination.lower().replace(" travel advice", "").strip()
+        if dest_lower and dest_lower not in seen_destinations:
+            seen_destinations.add(dest_lower)
+            _known_destinations.append(dest_lower)
         for section in page.get("sections", []):
             heading = section.get("heading", "")
             text = section.get("text", "")
@@ -92,16 +101,50 @@ def _build_rag_index():
     print(f"[RAG] Index built: {len(_rag_chunks)} chunks from {len(pages)} destinations")
 
 
-def _resolve_destination(query: str) -> str | None:
-    """Return the canonical destination name substring if an alias is found."""
+def _detect_destinations(query: str) -> list[str]:
+    """
+    Return all canonical destination substrings found in the query.
+    Checks alias map first, then scans known destination names directly.
+    """
     q_lower = query.lower()
+    found: list[str] = []
+
+    # Alias map takes priority (e.g. "dubai" → "united arab emirates")
     for alias, canonical in _DESTINATION_ALIASES.items():
-        if alias in q_lower:
-            return canonical
-    return None
+        if alias in q_lower and canonical not in found:
+            found.append(canonical)
+
+    # Direct match against known destination names
+    for dest in _known_destinations:
+        if dest in q_lower and dest not in found:
+            found.append(dest)
+
+    return found
 
 
-def retrieve_travel_advisory(query: str, top_k: int = 8) -> str:
+# Maps query topics → section-heading keywords that should be surfaced for the detected destination.
+_TOPIC_HEADING_MAP = {
+    "visa":     ("visa", "entry and exit", "entry requirements", "exit requirements", "passport"),
+    "entry":    ("visa", "entry and exit", "entry requirements", "passport"),
+    "vaccine":  ("vaccine", "health", "yellow fever", "routine vaccines", "pre-travel"),
+    "health":   ("health", "vaccine", "medication", "medical services"),
+    "law":      ("laws and culture", "legal process", "drugs", "alcohol", "dress"),
+    "crime":    ("crime", "safety and security", "fraud"),
+    "safety":   ("safety and security", "crime", "terrorism"),
+    "passport": ("passport", "visa", "entry and exit"),
+    "driving":  ("driving", "road safety"),
+    "currency": ("money",),
+    "money":    ("money",),
+}
+
+
+def _detect_topics(query: str) -> set[str]:
+    """Return the set of topic keywords from _TOPIC_HEADING_MAP that appear in the query."""
+    q_lower = query.lower()
+    return {topic for topic in _TOPIC_HEADING_MAP if topic in q_lower}
+
+
+def retrieve_travel_advisory(query: str, top_k: int = 15) -> str:
     """
     Retrieve the most relevant sections from parsed_pages.json for the given query.
     Returns a formatted context string ready to inject into the system prompt.
@@ -109,17 +152,22 @@ def retrieve_travel_advisory(query: str, top_k: int = 8) -> str:
     if _tfidf_vectorizer is None or _tfidf_matrix is None:
         return ""
 
-    # Expand query with alias resolution
-    canonical = _resolve_destination(query)
-    expanded_query = f"{query} {canonical}" if canonical else query
+    # Detect destinations and topics mentioned in the query
+    detected = _detect_destinations(query)
+    topics = _detect_topics(query)
+
+    # Expand the query with detected canonical names for better TF-IDF matching
+    expanded_query = query + (" " + " ".join(detected) if detected else "")
 
     query_vec = _tfidf_vectorizer.transform([expanded_query])
     scores = cosine_similarity(query_vec, _tfidf_matrix).flatten()
 
-    # If we resolved an alias, hard-boost all chunks from that destination
-    if canonical:
+    # Hard-boost all chunks belonging to detected destinations so they always win
+    # over generic topic matches from other countries.
+    if detected:
         for i, chunk in enumerate(_rag_chunks):
-            if canonical in chunk["destination"].lower():
+            dest_lower = chunk["destination"].lower()
+            if any(d in dest_lower for d in detected):
                 scores[i] = min(1.0, scores[i] + 0.5)
 
     top_indices = np.argsort(scores)[::-1][:top_k]
@@ -128,19 +176,29 @@ def retrieve_travel_advisory(query: str, top_k: int = 8) -> str:
         return ""
 
     # Collect matched destination names so we can prepend critical advisories
+    # and topic-specific sections for those destinations.
     matched_destinations: set[str] = set()
     for idx in top_indices:
         matched_destinations.add(_rag_chunks[idx]["destination"])
 
-    # Always prepend "avoid all travel" / "avoid non-essential travel" sections
-    # for matched destinations so the LLM never misses the headline advisory.
+    # Gather sections that MUST be included for matched destinations:
+    #   (a) critical "avoid travel" headlines
+    #   (b) sections whose heading matches one of the query topics
     _CRITICAL_KEYWORDS = ("avoid all travel", "avoid non-essential travel", "do not travel")
+    topic_heading_keywords: tuple[str, ...] = tuple(
+        kw for topic in topics for kw in _TOPIC_HEADING_MAP.get(topic, ())
+    )
+
     priority_chunks: list[dict] = []
+    topic_chunks: list[dict] = []
     for chunk in _rag_chunks:
         if chunk["destination"] not in matched_destinations:
             continue
-        if any(kw in chunk["heading"].lower() for kw in _CRITICAL_KEYWORDS):
+        heading_lower = chunk["heading"].lower()
+        if any(kw in heading_lower for kw in _CRITICAL_KEYWORDS):
             priority_chunks.append(chunk)
+        elif topic_heading_keywords and any(kw in heading_lower for kw in topic_heading_keywords):
+            topic_chunks.append(chunk)
 
     seen_dest_headings: set[str] = set()
     sections: list[str] = []
@@ -150,14 +208,13 @@ def retrieve_travel_advisory(query: str, top_k: int = 8) -> str:
         risk = f" [Risk level: {chunk['risk_level']}]" if chunk["risk_level"] else ""
         return f"[{dest_label} - {chunk['heading']}]{risk}\n{chunk['text']}"
 
-    # Priority sections first (deduped)
-    for chunk in priority_chunks:
+    # Order: critical advisories → topic-relevant sections → top TF-IDF matches
+    for chunk in priority_chunks + topic_chunks:
         key = f"{chunk['destination']}||{chunk['heading']}"
         if key not in seen_dest_headings:
             seen_dest_headings.add(key)
             sections.append(_format_chunk(chunk))
 
-    # Then top-ranked sections
     for idx in top_indices:
         chunk = _rag_chunks[idx]
         key = f"{chunk['destination']}||{chunk['heading']}"
@@ -234,6 +291,63 @@ def parse_intent(text):
     return None
 
 
+_MONTH_MAP = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7, "aug": 8,
+    "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def _parse_date(text: str) -> str | None:
+    """Find a date in the text, returning YYYY-MM-DD or None.
+    Accepts ISO (2026-04-15), "April 15, 2026", and "15 April 2026" formats."""
+    m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", text)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+    # "Month Day, Year" or "Month Day Year"
+    m = re.search(
+        r"\b(January|February|March|April|May|June|July|August|September|October|November|December|"
+        r"Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+(\d{1,2})(?:st|nd|rd|th)?[,\s]+(\d{4})\b",
+        text, re.IGNORECASE,
+    )
+    if m:
+        month = _MONTH_MAP.get(m.group(1).lower())
+        if month:
+            return f"{int(m.group(3)):04d}-{month:02d}-{int(m.group(2)):02d}"
+
+    # "Day Month Year"
+    m = re.search(
+        r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(January|February|March|April|May|June|July|August|"
+        r"September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+(\d{4})\b",
+        text, re.IGNORECASE,
+    )
+    if m:
+        month = _MONTH_MAP.get(m.group(2).lower())
+        if month:
+            return f"{int(m.group(3)):04d}-{month:02d}-{int(m.group(1)):02d}"
+
+    return None
+
+
+def _parse_time(text: str) -> str | None:
+    """Find a time in HH:MM format (24-hour). Also accepts 12-hour with am/pm."""
+    # 24-hour HH:MM preferred (must not be part of a year or ref number)
+    m = re.search(r"\b(?:time[:\s-]+)?(\d{1,2}):(\d{2})\s*(am|pm|a\.m\.|p\.m\.)?", text, re.IGNORECASE)
+    if m:
+        hour = int(m.group(1))
+        minute = int(m.group(2))
+        suffix = (m.group(3) or "").lower().replace(".", "")
+        if suffix == "pm" and hour < 12:
+            hour += 12
+        elif suffix == "am" and hour == 12:
+            hour = 0
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return f"{hour:02d}:{minute:02d}"
+    return None
+
+
 def extract_booking_from_messages(messages, response):
     """Parse booking details from the full conversation and save to bookings.json.
     Called whenever the agent returns a confirmation response."""
@@ -253,14 +367,15 @@ def extract_booking_from_messages(messages, response):
                      r"(?:in|at)\s+([A-Za-z]+(?:\s[A-Za-z]+)?)\s+(?:office|centre|center)"])
     name     = find([r"name[:\s-]+([A-Za-z][A-Za-z\s]+?)(?:\n|-|\*|$)",
                      r"(?:for|booking for)[:\s]+([A-Za-z][A-Za-z\s]{2,30})"])
-    appt_date = find([r"date[:\s-]+(\d{4}-\d{2}-\d{2})",
-                      r"(\d{4}-\d{2}-\d{2})"])
-    appt_time = find([r"time[:\s-]+(\d{1,2}:\d{2})",
-                      r"\bat\s+(\d{1,2}:\d{2})"])
+    appt_date = _parse_date(full_text)
+    appt_time = _parse_time(full_text)
 
     print(f"[EXTRACT DEBUG] service={service!r} location={location!r} date={appt_date!r} time={appt_time!r} name={name!r}")
     if not all([service, location, appt_date, appt_time, name]):
-        print(f"[EXTRACT DEBUG] Missing fields — booking NOT saved")
+        missing = [k for k, v in
+                   {"service": service, "location": location, "date": appt_date, "time": appt_time, "name": name}.items()
+                   if not v]
+        print(f"[EXTRACT DEBUG] Missing fields {missing} — booking NOT saved")
         return None
 
     bookings = []
@@ -270,9 +385,9 @@ def extract_booking_from_messages(messages, response):
         except Exception:
             bookings = []
 
-    # Avoid duplicates: same name + date + time
+    # Avoid duplicates: same date + time (slot already taken)
     for b in bookings:
-        if b.get("date") == appt_date and b.get("time") == appt_time and b.get("name", "").lower() == name.lower():
+        if b.get("date") == appt_date and b.get("time") == appt_time:
             return b["reference"]
 
     ref = "SIM-" + "".join(random.choices(string.digits, k=4))
@@ -288,6 +403,25 @@ def extract_booking_from_messages(messages, response):
     bookings.append(booking)
     BOOKINGS_FILE.write_text(json.dumps(bookings, indent=2))
     return ref
+
+
+# ── RAG query builder ─────────────────────────────────────────────────
+def build_rag_query(messages: list[dict], intent: str) -> str:
+    """
+    Build a focused retrieval query from the full conversation history.
+    For multi-turn flows (e.g. visa checker), the destination and passport
+    may appear in earlier messages, not just the latest one. We concatenate
+    all user messages so TF-IDF can match the full context.
+    """
+    user_texts = [m["content"] for m in messages if m["role"] == "user"]
+    combined = " ".join(user_texts)
+
+    # For visa queries, append a retrieval hint so the section heading "Visas"
+    # gets boosted alongside the destination terms.
+    if intent == "visa_checker":
+        combined = f"{combined} visa entry requirements"
+
+    return combined
 
 
 # ── API endpoint ──────────────────────────────────────────────────────
@@ -314,13 +448,9 @@ def chat():
         else:
             agent_prompt = PROMPT_MAP.get(intent, PROMPT_MAP["rag"])
 
-            # Build RAG query from the most recent user message
-            last_user_msg = next(
-                (m["content"] for m in reversed(messages) if m["role"] == "user"), ""
-            )
             rag_context = ""
             if intent in ("rag", "visa_checker"):
-                rag_context = retrieve_travel_advisory(last_user_msg)
+                rag_context = retrieve_travel_advisory(build_rag_query(messages, intent))
 
             response = call_llm(agent_prompt, messages, rag_context=rag_context)
 
